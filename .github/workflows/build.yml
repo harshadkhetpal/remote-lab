@@ -1,0 +1,48 @@
+name: build-host
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows x64 (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --bin remote-host
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-host-windows-x64
+          path: target/release/remote-host.exe
+
+  linux:
+    name: Linux x64 (binary + .deb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libclang-dev \
+            libxcb1-dev libxrandr-dev libxdo-dev \
+            libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev
+      - name: Build
+        run: cargo build --release --bin remote-host
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Build .deb
+        run: cargo deb --no-build --no-strip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-host-linux-x64
+          path: |
+            target/release/remote-host
+            target/debian/*.deb

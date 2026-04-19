@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>remote-lab viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0; padding: 0; height: 100%; background: #111; color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overscroll-behavior: none;
+    }
+    #bar {
+      position: fixed; top: 0; left: 0; right: 0;
+      padding: 6px 10px; background: rgba(0,0,0,0.55);
+      font-size: 12px; z-index: 10; display: flex; gap: 12px;
+    }
+    #bar b { color: #fff; }
+    #bar .ok { color: #4ade80; }
+    #bar .err { color: #f87171; }
+    #stage {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      touch-action: none;
+    }
+    #screen {
+      max-width: 100%; max-height: 100%;
+      image-rendering: auto;
+      user-select: none; -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    #help { position: fixed; bottom: 8px; left: 8px; right: 8px;
+      font-size: 11px; opacity: 0.6; text-align: center; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <span>remote-lab</span>
+    <span id="status">connecting…</span>
+    <span id="size"></span>
+    <span id="fps"></span>
+  </div>
+
+  <div id="stage">
+    <img id="screen" alt="remote screen" draggable="false" />
+  </div>
+
+  <div id="help">Tap = click • Long-press = right-click • Two-finger drag = scroll</div>
+
+<script>
+(() => {
+  const status = document.getElementById('status');
+  const sizeEl = document.getElementById('size');
+  const fpsEl  = document.getElementById('fps');
+  const img    = document.getElementById('screen');
+  const stage  = document.getElementById('stage');
+
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${wsProto}//${location.host}/`);
+  ws.binaryType = 'arraybuffer';
+
+  let lastUrl = null;
+  let frames = 0;
+  let lastFpsT = performance.now();
+
+  ws.onopen    = () => { status.textContent = 'connected'; status.className = 'ok'; };
+  ws.onerror   = () => { status.textContent = 'error';     status.className = 'err'; };
+  ws.onclose   = () => { status.textContent = 'closed';    status.className = 'err'; };
+
+  ws.onmessage = (ev) => {
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    const u8 = new Uint8Array(ev.data);
+    if (u8.length < 9 || u8[0] !== 0xF1) return;
+    const dv = new DataView(ev.data);
+    const w = dv.getUint32(1, true);
+    const h = dv.getUint32(5, true);
+    const jpeg = u8.subarray(9);
+
+    const blob = new Blob([jpeg], { type: 'image/jpeg' });
+    const url = URL.createObjectURL(blob);
+    if (lastUrl) URL.revokeObjectURL(lastUrl);
+    lastUrl = url;
+    img.src = url;
+    sizeEl.textContent = `${w}×${h}`;
+
+    frames++;
+    const now = performance.now();
+    if (now - lastFpsT > 1000) {
+      fpsEl.textContent = `${frames} fps`;
+      frames = 0;
+      lastFpsT = now;
+    }
+  };
+
+  function send(obj) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  function imgRect() { return img.getBoundingClientRect(); }
+
+  function normalize(clientX, clientY) {
+    const r = imgRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    const x = (clientX - r.left) / r.width;
+    const y = (clientY - r.top)  / r.height;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
+  }
+
+  // ---- Mouse (desktop browsers) ----
+  stage.addEventListener('mousemove', (e) => {
+    const n = normalize(e.clientX, e.clientY); if (!n) return;
+    send({ type: 'mouse_move', x: n.x, y: n.y });
+  });
+  stage.addEventListener('mousedown', (e) => {
+    const n = normalize(e.clientX, e.clientY); if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
+    send({ type: 'mouse_down', button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left' });
+    e.preventDefault();
+  });
+  stage.addEventListener('mouseup', (e) => {
+    send({ type: 'mouse_up', button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left' });
+  });
+  stage.addEventListener('contextmenu', (e) => e.preventDefault());
+  stage.addEventListener('wheel', (e) => {
+    send({ type: 'scroll', dx: e.deltaX, dy: -e.deltaY });
+    e.preventDefault();
+  }, { passive: false });
+
+  // ---- Touch (mobile) ----
+  let touchStart = null, longPressTimer = null, longPressed = false;
+  let twoFingerLastY = null, twoFingerLastX = null;
+
+  stage.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      touchStart = { x: t.clientX, y: t.clientY, t: performance.now() };
+      const n = normalize(t.clientX, t.clientY);
+      if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
+      longPressed = false;
+      longPressTimer = setTimeout(() => {
+        longPressed = true;
+        send({ type: 'mouse_down', button: 'right' });
+        send({ type: 'mouse_up',   button: 'right' });
+      }, 550);
+    } else if (e.touches.length === 2) {
+      clearTimeout(longPressTimer);
+      const [a, b] = e.touches;
+      twoFingerLastY = (a.clientY + b.clientY) / 2;
+      twoFingerLastX = (a.clientX + b.clientX) / 2;
+    }
+    e.preventDefault();
+  }, { passive: false });
+
+  stage.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 1 && touchStart) {
+      const t = e.touches[0];
+      if (Math.hypot(t.clientX - touchStart.x, t.clientY - touchStart.y) > 8) {
+        clearTimeout(longPressTimer);
+      }
+      const n = normalize(t.clientX, t.clientY);
+      if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
+    } else if (e.touches.length === 2 && twoFingerLastY !== null) {
+      const [a, b] = e.touches;
+      const cy = (a.clientY + b.clientY) / 2;
+      const cx = (a.clientX + b.clientX) / 2;
+      const dy = cy - twoFingerLastY;
+      const dx = cx - twoFingerLastX;
+      twoFingerLastY = cy;
+      twoFingerLastX = cx;
+      send({ type: 'scroll', dx: dx, dy: dy });
+    }
+    e.preventDefault();
+  }, { passive: false });
+
+  stage.addEventListener('touchend', (e) => {
+    clearTimeout(longPressTimer);
+    if (touchStart && !longPressed && e.touches.length === 0) {
+      const dt = performance.now() - touchStart.t;
+      if (dt < 350) {
+        send({ type: 'mouse_down', button: 'left' });
+        send({ type: 'mouse_up',   button: 'left' });
+      }
+    }
+    if (e.touches.length < 2) { twoFingerLastY = null; twoFingerLastX = null; }
+    if (e.touches.length === 0) touchStart = null;
+    e.preventDefault();
+  }, { passive: false });
+
+  // ---- Keyboard (desktop browsers) ----
+  const NAMED = {
+    'Enter':'return','Tab':'tab',' ':'space','Backspace':'backspace','Escape':'escape','Delete':'delete',
+    'ArrowUp':'up','ArrowDown':'down','ArrowLeft':'left','ArrowRight':'right',
+    'Home':'home','End':'end','PageUp':'pageup','PageDown':'pagedown',
+    'F1':'f1','F2':'f2','F3':'f3','F4':'f4','F5':'f5','F6':'f6','F7':'f7','F8':'f8','F9':'f9','F10':'f10','F11':'f11','F12':'f12',
+    'Shift':'shift','Control':'control','Alt':'alt','Meta':'meta'
+  };
+  function keyName(e) {
+    if (NAMED[e.key]) return NAMED[e.key];
+    if (e.key.length === 1) return e.key.toLowerCase();
+    return null;
+  }
+  window.addEventListener('keydown', (e) => {
+    const k = keyName(e); if (!k) return;
+    send({ type: 'key_down', key: k });
+    if (e.key !== 'F5' && e.key !== 'F12') e.preventDefault();
+  });
+  window.addEventListener('keyup', (e) => {
+    const k = keyName(e); if (!k) return;
+    send({ type: 'key_up', key: k });
+  });
+})();
+</script>
+</body>
+</html>
