@@ -57,7 +57,9 @@
   const stage  = document.getElementById('stage');
 
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${wsProto}//${location.host}/`);
+  const token = (window.__TOKEN__ || new URLSearchParams(location.search).get('token') || '').toString();
+  const wsUrl = `${wsProto}//${location.host}/${token ? '?token=' + encodeURIComponent(token) : ''}`;
+  const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
 
   let lastUrl = null;

@@ -43,6 +43,12 @@ struct Args {
     #[arg(long, default_value_t = 1280)]
     max_width: u32,
 
+    /// Shared secret. If set, viewers must send ?token=<value> in the URL.
+    /// Strongly recommended whenever the host is reachable from the internet
+    /// (e.g. behind a Cloudflare Tunnel). Leave empty for trusted LAN-only use.
+    #[arg(long, default_value = "")]
+    auth_token: String,
+
     /// Print detected monitors and exit
     #[arg(long)]
     list_monitors: bool,
@@ -77,6 +83,11 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", args.bind))?;
     println!("remote-host listening on http://{}  (open this URL on your phone)", args.bind);
+    if args.auth_token.is_empty() {
+        println!("WARNING: no --auth-token set. Anyone who can reach this host can control it.");
+    } else {
+        println!("Auth ON. Viewer URL: http://<host>:<port>/?token={}", args.auth_token);
+    }
     println!("Native viewer: cargo run --bin remote-viewer -- --url ws://<host-ip>:PORT/");
     println!("macOS: grant Accessibility + Screen Recording to Terminal/IDE running this binary.");
 
@@ -88,6 +99,7 @@ async fn main() -> Result<()> {
             fps: args.fps,
             jpeg_quality: args.jpeg_quality,
             max_width: args.max_width,
+            auth_token: args.auth_token.clone(),
             list_monitors: false,
         };
         tokio::spawn(async move {
@@ -100,23 +112,105 @@ async fn main() -> Result<()> {
 }
 
 async fn dispatch(stream: TcpStream, args: Args) -> Result<()> {
-    let mut peek = [0u8; 1024];
+    let mut peek = [0u8; 4096];
     let n = stream.peek(&mut peek).await.unwrap_or(0);
     let head = std::str::from_utf8(&peek[..n]).unwrap_or("");
 
-    let is_ws = head
-        .lines()
-        .any(|l| l.to_ascii_lowercase().starts_with("upgrade:") && l.to_ascii_lowercase().contains("websocket"));
+    let supplied = extract_token(head).unwrap_or_default();
+    let token_ok = args.auth_token.is_empty() || constant_time_eq(supplied.as_bytes(), args.auth_token.as_bytes());
+
+    let is_ws = head.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("upgrade:") && l.contains("websocket")
+    });
 
     if is_ws {
+        if !token_ok {
+            return Err(anyhow!("ws rejected: bad or missing token"));
+        }
         handle_ws_client(stream, args).await
     } else {
-        serve_http(stream).await
+        serve_http(stream, &args, token_ok).await
     }
 }
 
-async fn serve_http(mut stream: TcpStream) -> Result<()> {
-    let body = VIEWER_HTML.as_bytes();
+fn extract_token(head: &str) -> Option<String> {
+    let first = head.lines().next()?;
+    let parts: Vec<&str> = first.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let path_q = parts[1];
+    let q = path_q.split_once('?')?.1;
+    for kv in q.split('&') {
+        if let Some(("token", v)) = kv.split_once('=') {
+            return Some(url_decode(v));
+        }
+    }
+    None
+}
+
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let h = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(b) = u8::from_str_radix(h, 16) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+async fn serve_http(mut stream: TcpStream, args: &Args, token_ok: bool) -> Result<()> {
+    if !token_ok {
+        let body = b"401 unauthorized: append ?token=YOUR_TOKEN to the URL.\n";
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.write_all(body).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+    let token_js = format!(
+        "<script>window.__TOKEN__={};</script>",
+        serde_json::to_string(&args.auth_token).unwrap_or_else(|_| "\"\"".into())
+    );
+    let html = VIEWER_HTML.replacen("</head>", &format!("{token_js}</head>"), 1);
+    let body = html.as_bytes();
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
