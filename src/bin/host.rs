@@ -135,9 +135,11 @@ async fn handle_ws_client(stream: TcpStream, args: Args) -> Result<()> {
     let ws = accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
-    let monitors = xcap::Monitor::all().map_err(|e| anyhow!("monitors: {e}"))?;
-    if monitors.get(args.monitor).is_none() {
-        return Err(anyhow!("monitor index {} not found", args.monitor));
+    {
+        let monitors = xcap::Monitor::all().map_err(|e| anyhow!("monitors: {e}"))?;
+        if monitors.get(args.monitor).is_none() {
+            return Err(anyhow!("monitor index {} not found", args.monitor));
+        }
     }
     let monitor_index = args.monitor;
 

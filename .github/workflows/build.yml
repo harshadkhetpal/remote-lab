@@ -33,7 +33,8 @@ jobs:
           sudo apt-get install -y \
             pkg-config libclang-dev \
             libxcb1-dev libxrandr-dev libxdo-dev \
-            libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev
+            libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev \
+            libgbm-dev libdrm-dev
       - name: Build
         run: cargo build --release --bin remote-host
       - name: Install cargo-deb
