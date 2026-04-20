@@ -22,7 +22,9 @@ jobs:
 
   linux:
     name: Linux x64 (binary + .deb)
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (glibc 2.35) for broad compatibility.
+    # Binary will also run on Ubuntu 24.04, Debian 12, Mint 21, Pop!_OS 22.04+, etc.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
