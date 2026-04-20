@@ -33,6 +33,9 @@ jobs:
           prefix-key: "v2-ubuntu-22.04"
       - name: Install build deps
         run: |
+          # Add upstream PipeWire PPA so we get a modern libpipewire/libspa
+          # that matches the Rust libspa crate's expected C struct layout.
+          sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config libclang-dev \
