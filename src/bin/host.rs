@@ -7,10 +7,13 @@ use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Se
 use futures_util::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::ExtendedColorType;
-use remote_lab::{InputMessage, MouseButton, FRAME_MAGIC};
+use remote_lab::session::{Consent, Supervisor};
+use remote_lab::{HostMessage, InputMessage, MouseButton, FRAME_MAGIC};
 use std::io::Cursor;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_async;
@@ -20,7 +23,7 @@ const VIEWER_HTML: &str = include_str!("../../web/viewer.html");
 
 static INPUT_TX: OnceLock<std::sync::mpsc::Sender<InputMessage>> = OnceLock::new();
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "remote-host")]
 struct Args {
     /// Address to listen on, e.g. 0.0.0.0:9753
@@ -48,6 +51,20 @@ struct Args {
     /// (e.g. behind a Cloudflare Tunnel). Leave empty for trusted LAN-only use.
     #[arg(long, default_value = "")]
     auth_token: String,
+
+    /// Require an interactive y/N confirmation on the host's terminal for every
+    /// new viewer IP, before the WebSocket session is allowed to start.
+    #[arg(long)]
+    require_consent: bool,
+
+    /// Seconds to wait for a consent answer before auto-denying.
+    #[arg(long, default_value_t = 30)]
+    consent_timeout: u64,
+
+    /// Disable desktop notifications (use this if your environment has no
+    /// notification daemon, e.g. headless server, or you prefer console-only).
+    #[arg(long)]
+    no_notifications: bool,
 
     /// Print detected monitors and exit
     #[arg(long)]
@@ -79,6 +96,9 @@ async fn main() -> Result<()> {
         .name("input-injector".into())
         .spawn(move || input_thread(rx))?;
 
+    let supervisor = Arc::new(Supervisor::new(!args.no_notifications));
+    eprintln!("[remote-lab] session log: {}", supervisor.log_path().display());
+
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("bind {}", args.bind))?;
@@ -88,22 +108,21 @@ async fn main() -> Result<()> {
     } else {
         println!("Auth ON. Viewer URL: http://<host>:<port>/?token={}", args.auth_token);
     }
+    if args.require_consent {
+        println!(
+            "Consent ON. The terminal will ask you to allow each new viewer IP (timeout {}s).",
+            args.consent_timeout
+        );
+    }
     println!("Native viewer: cargo run --bin remote-viewer -- --url ws://<host-ip>:PORT/");
     println!("macOS: grant Accessibility + Screen Recording to Terminal/IDE running this binary.");
 
     while let Ok((stream, addr)) = listener.accept().await {
         println!("client connecting: {addr}");
-        let args = Args {
-            bind: args.bind.clone(),
-            monitor: args.monitor,
-            fps: args.fps,
-            jpeg_quality: args.jpeg_quality,
-            max_width: args.max_width,
-            auth_token: args.auth_token.clone(),
-            list_monitors: false,
-        };
+        let args = args.clone();
+        let supervisor = supervisor.clone();
         tokio::spawn(async move {
-            if let Err(e) = dispatch(stream, args).await {
+            if let Err(e) = dispatch(stream, args, supervisor, addr).await {
                 eprintln!("session ended ({addr}): {e:#}");
             }
         });
@@ -111,7 +130,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn dispatch(stream: TcpStream, args: Args) -> Result<()> {
+async fn dispatch(
+    stream: TcpStream,
+    args: Args,
+    supervisor: Arc<Supervisor>,
+    peer: SocketAddr,
+) -> Result<()> {
     let mut peek = [0u8; 4096];
     let n = stream.peek(&mut peek).await.unwrap_or(0);
     let head = std::str::from_utf8(&peek[..n]).unwrap_or("");
@@ -126,9 +150,21 @@ async fn dispatch(stream: TcpStream, args: Args) -> Result<()> {
 
     if is_ws {
         if !token_ok {
+            supervisor.on_denied(peer, "bad or missing token");
             return Err(anyhow!("ws rejected: bad or missing token"));
         }
-        handle_ws_client(stream, args).await
+        let decision = supervisor
+            .gate(
+                peer,
+                args.require_consent,
+                Duration::from_secs(args.consent_timeout),
+            )
+            .await;
+        if decision == Consent::Deny {
+            supervisor.on_denied(peer, "consent denied");
+            return Err(anyhow!("ws rejected: consent denied"));
+        }
+        handle_ws_client(stream, args, supervisor, peer).await
     } else {
         serve_http(stream, &args, token_ok).await
     }
@@ -225,7 +261,12 @@ async fn serve_http(mut stream: TcpStream, args: &Args, token_ok: bool) -> Resul
     Ok(())
 }
 
-async fn handle_ws_client(stream: TcpStream, args: Args) -> Result<()> {
+async fn handle_ws_client(
+    stream: TcpStream,
+    args: Args,
+    supervisor: Arc<Supervisor>,
+    peer: SocketAddr,
+) -> Result<()> {
     let ws = accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
@@ -237,6 +278,19 @@ async fn handle_ws_client(stream: TcpStream, args: Args) -> Result<()> {
     }
     let monitor_index = args.monitor;
 
+    // Session is now active — emit the indicator.
+    let started_at = SystemTime::now();
+    supervisor.on_connect(peer);
+
+    // Welcome the viewer so it can show a status badge.
+    let welcome = HostMessage::Welcome {
+        host: hostname_or_unknown(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    if let Ok(s) = serde_json::to_string(&welcome) {
+        let _ = write.send(Message::Text(s)).await;
+    }
+
     // Pump incoming input messages on a separate task so the frame loop
     // never blocks waiting for them.
     let input_task = tokio::spawn(async move {
@@ -245,8 +299,17 @@ async fn handle_ws_client(stream: TcpStream, args: Args) -> Result<()> {
             match msg {
                 Message::Text(t) => {
                     if let Ok(input) = serde_json::from_str::<InputMessage>(&t) {
-                        if let Some(tx) = INPUT_TX.get() {
-                            let _ = tx.send(input);
+                        match input {
+                            InputMessage::ClipboardWrite { text } => {
+                                if let Err(e) = remote_lab::session::apply_clipboard_write(&text) {
+                                    eprintln!("[remote-lab] clipboard write failed: {e:#}");
+                                }
+                            }
+                            other => {
+                                if let Some(tx) = INPUT_TX.get() {
+                                    let _ = tx.send(other);
+                                }
+                            }
                         }
                     }
                 }
@@ -330,7 +393,15 @@ async fn handle_ws_client(stream: TcpStream, args: Args) -> Result<()> {
     .await;
 
     input_task.abort();
+    supervisor.on_disconnect(peer, started_at);
     result
+}
+
+fn hostname_or_unknown() -> String {
+    // No portable stdlib hostname; cross-platform crates exist but we want zero new deps here.
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "remote-lab-host".to_string())
 }
 
 fn nearest_resize_rgb(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
@@ -416,6 +487,9 @@ fn apply_input(g: &mut Enigo, input: InputMessage) -> Result<()> {
                     .map_err(|e| anyhow!("key: {e}"))?;
             }
         }
+        // ClipboardWrite is handled directly in the WS reader so it never reaches
+        // the input-injection thread. This arm is for exhaustiveness only.
+        InputMessage::ClipboardWrite { .. } => {}
     }
     Ok(())
 }

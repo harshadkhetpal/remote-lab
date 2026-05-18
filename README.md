@@ -121,13 +121,49 @@ Cloudflare Access — out of scope for this MVP.
 ```
 remote-host [OPTIONS]
 
-  --bind <ADDR>           default 0.0.0.0:9753
-  --monitor <INDEX>       default 0
-  --fps <N>               default 12
-  --jpeg-quality <1-100>  default 60
-  --max-width <PX>        default 1280  (0 = capture native resolution)
-  --list-monitors         print monitors and exit
+  --bind <ADDR>            default 0.0.0.0:9753
+  --monitor <INDEX>        default 0
+  --fps <N>                default 12
+  --jpeg-quality <1-100>   default 60
+  --max-width <PX>         default 1280  (0 = capture native resolution)
+  --auth-token <SECRET>    shared secret required as ?token=... in viewer URL
+  --require-consent        prompt y/N on the host terminal for every new viewer IP
+  --consent-timeout <SEC>  auto-deny if no answer (default 30)
+  --no-notifications       suppress desktop notifications (console-only)
+  --list-monitors          print monitors and exit
 ```
+
+---
+
+## Session indicator, consent, and audit log
+
+When a viewer connects, the host is informed in non-intrusive ways
+(no screen tinting, flashing, or overlays):
+
+1. **Desktop notification** — *"Remote session started · Viewer connected from X.X.X.X"*.
+2. **Terminal line** — `[remote-lab] viewer connected: ...` in the shell that
+   launched `remote-host`.
+3. **Append-only log** — every CONNECT, DISCONN, and DENIED event is written
+   to `~/.remote-lab/sessions.log` (or `%USERPROFILE%\.remote-lab\sessions.log`
+   on Windows) with an ISO-8601 UTC timestamp and the peer address.
+
+To require an explicit y/N before each new viewer IP can start a session,
+run with `--require-consent`. The WebSocket handshake pauses while the
+host's terminal prompts:
+
+```
+[remote-lab] CONSENT: allow viewer from 192.168.1.42? type `y` + Enter within 30 s to allow, anything else denies.
+```
+
+Type `y` + Enter to allow (remembered for the lifetime of this host process);
+anything else, or letting the timer expire, denies the connection.
+
+## Clipboard
+
+The browser viewer has a **Clipboard** button (bottom-right). Open it, paste
+or type a snippet, click **Send to host** — that text is written into the
+host machine's system clipboard. Handy for shipping a URL or password from
+your phone to the controlled computer.
 
 ---
 
@@ -140,3 +176,5 @@ remote-host [OPTIONS]
 | Phone can connect locally but not via cloudflared URL | Make sure cloudflared is still running; the trycloudflare URL changes each launch |
 | Lag is bad | Make sure you built `--release`; lower `--max-width` (e.g. 960) and `--jpeg-quality` (e.g. 45) |
 | `cargo: command not found` | Open a new shell or `source $HOME/.cargo/env` |
+| No desktop notifications appear | Either no notification daemon is running (headless), or your DE blocks them. The console line + log file still record every event. Use `--no-notifications` to silence the failed-to-send error. |
+| Clipboard send does nothing | macOS needs first-launch consent for clipboard access; Linux needs `xclip`-compatible clipboard or Wayland clipboard portal. Check the host terminal for errors. |

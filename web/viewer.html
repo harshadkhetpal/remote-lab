@@ -32,6 +32,30 @@
     }
     #help { position: fixed; bottom: 8px; left: 8px; right: 8px;
       font-size: 11px; opacity: 0.6; text-align: center; }
+    #clipToggle {
+      position: fixed; bottom: 28px; right: 12px;
+      padding: 4px 10px; cursor: pointer;
+      background: rgba(0,0,0,0.55); color: #eee; border: 0; border-radius: 4px; font-size: 12px;
+    }
+    #clip {
+      position: fixed; bottom: 28px; right: 12px;
+      display: flex; flex-direction: column; gap: 4px;
+      background: rgba(0,0,0,0.7); padding: 8px; border-radius: 8px;
+      font-size: 12px; max-width: 280px;
+    }
+    #clip textarea {
+      width: 240px; min-height: 60px; resize: vertical;
+      background: #222; color: #eee; border: 1px solid #444; border-radius: 4px;
+      font-family: inherit; font-size: 12px; padding: 4px;
+    }
+    #clip .row { display: flex; gap: 6px; justify-content: flex-end; }
+    #clip button {
+      padding: 4px 10px; cursor: pointer;
+      background: #2563eb; color: #fff; border: 0; border-radius: 4px; font-size: 12px;
+    }
+    #clip button.secondary { background: #444; }
+    #clip button:hover { filter: brightness(1.15); }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
@@ -47,6 +71,15 @@
   </div>
 
   <div id="help">Tap = click • Long-press = right-click • Two-finger drag = scroll</div>
+
+  <button id="clipToggle" type="button">Clipboard</button>
+  <div id="clip" class="hidden">
+    <textarea id="clipText" placeholder="Type or paste here, then Send to push to host clipboard."></textarea>
+    <div class="row">
+      <button id="clipClose" class="secondary" type="button">Close</button>
+      <button id="clipSend" type="button">Send to host</button>
+    </div>
+  </div>
 
 <script>
 (() => {
@@ -71,6 +104,15 @@
   ws.onclose   = () => { status.textContent = 'closed';    status.className = 'err'; };
 
   ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg && msg.type === 'welcome' && msg.host) {
+          status.textContent = `connected · ${msg.host}`;
+        }
+      } catch (_) {}
+      return;
+    }
     if (!(ev.data instanceof ArrayBuffer)) return;
     const u8 = new Uint8Array(ev.data);
     if (u8.length < 9 || u8[0] !== 0xF1) return;
@@ -98,6 +140,25 @@
   function send(obj) {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
+
+  // ---- Clipboard panel ----
+  const clip = document.getElementById('clip');
+  const clipToggle = document.getElementById('clipToggle');
+  const clipClose = document.getElementById('clipClose');
+  const clipSend = document.getElementById('clipSend');
+  const clipText = document.getElementById('clipText');
+  function showClip(show) {
+    clip.classList.toggle('hidden', !show);
+    clipToggle.classList.toggle('hidden', show);
+  }
+  clipToggle.addEventListener('click', () => showClip(true));
+  clipClose.addEventListener('click', () => showClip(false));
+  clipSend.addEventListener('click', () => {
+    const text = clipText.value || '';
+    if (!text) return;
+    send({ type: 'clipboard_write', text });
+    showClip(false);
+  });
 
   function imgRect() { return img.getBoundingClientRect(); }
 
