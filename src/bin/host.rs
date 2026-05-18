@@ -97,16 +97,25 @@ async fn main() -> Result<()> {
         .spawn(move || input_thread(rx))?;
 
     let supervisor = Arc::new(Supervisor::new(!args.no_notifications));
-    eprintln!("[remote-lab] session log: {}", supervisor.log_path().display());
+    eprintln!(
+        "[remote-lab] session log: {}",
+        supervisor.log_path().display()
+    );
 
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("bind {}", args.bind))?;
-    println!("remote-host listening on http://{}  (open this URL on your phone)", args.bind);
+    println!(
+        "remote-host listening on http://{}  (open this URL on your phone)",
+        args.bind
+    );
     if args.auth_token.is_empty() {
         println!("WARNING: no --auth-token set. Anyone who can reach this host can control it.");
     } else {
-        println!("Auth ON. Viewer URL: http://<host>:<port>/?token={}", args.auth_token);
+        println!(
+            "Auth ON. Viewer URL: http://<host>:<port>/?token={}",
+            args.auth_token
+        );
     }
     if args.require_consent {
         println!(
@@ -141,7 +150,8 @@ async fn dispatch(
     let head = std::str::from_utf8(&peek[..n]).unwrap_or("");
 
     let supplied = extract_token(head).unwrap_or_default();
-    let token_ok = args.auth_token.is_empty() || constant_time_eq(supplied.as_bytes(), args.auth_token.as_bytes());
+    let token_ok = args.auth_token.is_empty()
+        || constant_time_eq(supplied.as_bytes(), args.auth_token.as_bytes());
 
     let is_ws = head.lines().any(|l| {
         let l = l.to_ascii_lowercase();

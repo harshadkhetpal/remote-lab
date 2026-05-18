@@ -66,13 +66,12 @@ impl Supervisor {
     pub fn on_connect(&self, peer: SocketAddr) {
         let line = format!("viewer connected: {}", peer);
         eprintln!("[remote-lab] {}", line);
-        self.append_log(&format!(
-            "{} CONNECT  {}",
-            iso_now(),
-            peer
-        ));
+        self.append_log(&format!("{} CONNECT  {}", iso_now(), peer));
         if self.notifications_enabled {
-            self.notify("Remote session started", &format!("Viewer connected from {}", peer));
+            self.notify(
+                "Remote session started",
+                &format!("Viewer connected from {}", peer),
+            );
         }
     }
 
@@ -210,6 +209,7 @@ async fn prompt_terminal(peer_ip: &str, timeout: Duration) -> Consent {
 /// Apply a clipboard write coming from the viewer. Best-effort: failures are logged.
 pub fn apply_clipboard_write(text: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
-    cb.set_text(text.to_string()).context("set clipboard text")?;
+    cb.set_text(text.to_string())
+        .context("set clipboard text")?;
     Ok(())
 }

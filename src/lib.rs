@@ -10,14 +10,30 @@ pub const FRAME_MAGIC: u8 = 0xF1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputMessage {
-    MouseMove { x: f32, y: f32 },
-    MouseDown { button: MouseButton },
-    MouseUp { button: MouseButton },
-    Scroll { dx: f32, dy: f32 },
-    KeyDown { key: String },
-    KeyUp { key: String },
+    MouseMove {
+        x: f32,
+        y: f32,
+    },
+    MouseDown {
+        button: MouseButton,
+    },
+    MouseUp {
+        button: MouseButton,
+    },
+    Scroll {
+        dx: f32,
+        dy: f32,
+    },
+    KeyDown {
+        key: String,
+    },
+    KeyUp {
+        key: String,
+    },
     /// Push a text snippet from the viewer into the host's clipboard.
-    ClipboardWrite { text: String },
+    ClipboardWrite {
+        text: String,
+    },
 }
 
 /// Text-frame messages the host sends to the viewer (binary frames stay JPEG).
