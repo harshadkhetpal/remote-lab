@@ -8,13 +8,15 @@ use futures_util::{SinkExt, StreamExt};
 use image::codecs::jpeg::JpegEncoder;
 use image::ExtendedColorType;
 use remote_lab::session::{Consent, Supervisor};
-use remote_lab::{HostMessage, InputMessage, MouseButton, FRAME_MAGIC};
+use remote_lab::{
+    constant_time_eq, extract_token, HostMessage, InputMessage, MouseButton, FRAME_MAGIC,
+};
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -71,8 +73,15 @@ struct Args {
     list_monitors: bool,
 }
 
-static CAP_W: AtomicU32 = AtomicU32::new(1);
-static CAP_H: AtomicU32 = AtomicU32::new(1);
+// Logical geometry of the streamed monitor, used to map normalized viewer
+// coordinates to OS mouse coordinates. Capture frames can be in physical
+// pixels (e.g. 2x on macOS Retina) while enigo positions the cursor in
+// logical points, so input mapping must use the monitor's reported size,
+// never the capture size.
+static MON_X: AtomicI32 = AtomicI32::new(0);
+static MON_Y: AtomicI32 = AtomicI32::new(0);
+static MON_W: AtomicU32 = AtomicU32::new(1);
+static MON_H: AtomicU32 = AtomicU32::new(1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,6 +110,10 @@ async fn main() -> Result<()> {
         "[remote-lab] session log: {}",
         supervisor.log_path().display()
     );
+
+    if !(1..=100).contains(&args.jpeg_quality) {
+        return Err(anyhow!("--jpeg-quality must be 1–100"));
+    }
 
     let listener = TcpListener::bind(&args.bind)
         .await
@@ -180,63 +193,13 @@ async fn dispatch(
     }
 }
 
-fn extract_token(head: &str) -> Option<String> {
-    let first = head.lines().next()?;
-    let parts: Vec<&str> = first.split_whitespace().collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let path_q = parts[1];
-    let q = path_q.split_once('?')?.1;
-    for kv in q.split('&') {
-        if let Some(("token", v)) = kv.split_once('=') {
-            return Some(url_decode(v));
-        }
-    }
-    None
-}
-
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let h = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                if let Ok(b) = u8::from_str_radix(h, 16) {
-                    out.push(b);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap_or_default()
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 async fn serve_http(mut stream: TcpStream, args: &Args, token_ok: bool) -> Result<()> {
+    // dispatch() only peeked at the request. Consume it before responding:
+    // dropping a socket with unread data in its receive buffer makes the
+    // kernel send RST instead of FIN, which can discard the response while
+    // it is still in flight (blank page / connection reset in the browser).
+    let mut drain = [0u8; 4096];
+    let _ = stream.read(&mut drain).await;
     if !token_ok {
         let body = b"401 unauthorized: append ?token=YOUR_TOKEN to the URL.\n";
         let response = format!(
@@ -249,6 +212,7 @@ async fn serve_http(mut stream: TcpStream, args: &Args, token_ok: bool) -> Resul
         stream.write_all(response.as_bytes()).await?;
         stream.write_all(body).await?;
         stream.flush().await?;
+        let _ = stream.shutdown().await;
         return Ok(());
     }
     let token_js = format!(
@@ -268,6 +232,7 @@ async fn serve_http(mut stream: TcpStream, args: &Args, token_ok: bool) -> Resul
     stream.write_all(response.as_bytes()).await?;
     stream.write_all(body).await?;
     stream.flush().await?;
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
@@ -282,9 +247,17 @@ async fn handle_ws_client(
 
     {
         let monitors = xcap::Monitor::all().map_err(|e| anyhow!("monitors: {e}"))?;
-        if monitors.get(args.monitor).is_none() {
+        let Some(mon) = monitors.get(args.monitor) else {
             return Err(anyhow!("monitor index {} not found", args.monitor));
-        }
+        };
+        let (w, h) = (
+            mon.width().map_err(|e| anyhow!("monitor width: {e}"))?,
+            mon.height().map_err(|e| anyhow!("monitor height: {e}"))?,
+        );
+        MON_X.store(mon.x().unwrap_or(0), Ordering::Relaxed);
+        MON_Y.store(mon.y().unwrap_or(0), Ordering::Relaxed);
+        MON_W.store(w.max(1), Ordering::Relaxed);
+        MON_H.store(h.max(1), Ordering::Relaxed);
     }
     let monitor_index = args.monitor;
 
@@ -351,8 +324,6 @@ async fn handle_ws_client(
                     }
                 };
                 let (cap_w, cap_h) = (rgba.width(), rgba.height());
-                CAP_W.store(cap_w, Ordering::Relaxed);
-                CAP_H.store(cap_h, Ordering::Relaxed);
 
                 let raw = rgba.as_raw();
                 let mut rgb = Vec::with_capacity((cap_w as usize) * (cap_h as usize) * 3);
@@ -408,9 +379,22 @@ async fn handle_ws_client(
 }
 
 fn hostname_or_unknown() -> String {
-    // No portable stdlib hostname; cross-platform crates exist but we want zero new deps here.
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
+        .or_else(|_| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
+                .ok_or_else(|| std::env::VarError::NotPresent)
+        })
         .unwrap_or_else(|_| "remote-lab-host".to_string())
 }
 
@@ -447,13 +431,15 @@ fn input_thread(rx: std::sync::mpsc::Receiver<InputMessage>) {
 }
 
 fn apply_input(g: &mut Enigo, input: InputMessage) -> Result<()> {
-    let w = CAP_W.load(Ordering::Relaxed).max(1);
-    let h = CAP_H.load(Ordering::Relaxed).max(1);
+    let w = MON_W.load(Ordering::Relaxed).max(1);
+    let h = MON_H.load(Ordering::Relaxed).max(1);
+    let ox = MON_X.load(Ordering::Relaxed);
+    let oy = MON_Y.load(Ordering::Relaxed);
 
     match input {
         InputMessage::MouseMove { x, y } => {
-            let px = (x.clamp(0.0, 1.0) * w as f32).round() as i32;
-            let py = (y.clamp(0.0, 1.0) * h as f32).round() as i32;
+            let px = ox + (x.clamp(0.0, 1.0) * w as f32).round() as i32;
+            let py = oy + (y.clamp(0.0, 1.0) * h as f32).round() as i32;
             g.move_mouse(px, py, Coordinate::Abs)
                 .map_err(|e| anyhow!("mouse move: {e}"))?;
         }
