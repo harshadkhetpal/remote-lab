@@ -11,6 +11,8 @@ use remote_lab::session::{Consent, Supervisor};
 use remote_lab::{
     constant_time_eq, extract_token, HostMessage, InputMessage, MouseButton, FRAME_MAGIC,
 };
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -306,12 +308,27 @@ async fn handle_ws_client(
     let max_w = args.max_width;
     let quality = args.jpeg_quality;
 
+    // Change detection: skip encoding/sending a frame when the screen is
+    // pixel-identical to the last one we sent. On a mostly-static desktop this
+    // frees the whole link so real changes arrive fast — a big win on thin
+    // connections (e.g. a free tunnel). As insurance against a dropped frame
+    // leaving a viewer stuck, we still force a "keyframe" periodically.
+    let keepalive = tokio::time::Duration::from_secs(2);
+    let mut last_hash: u64 = 0;
+    let mut have_sent = false;
+    let mut last_send_at = tokio::time::Instant::now();
+
     let result: Result<()> = async {
         loop {
             let frame_started = tokio::time::Instant::now();
+            let force_keyframe = !have_sent || frame_started.duration_since(last_send_at) >= keepalive;
+            let prev_hash = last_hash;
 
             // Capture + encode on a blocking thread so the async runtime stays free.
-            let payload = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            // Returns None when nothing should be sent (capture failed, or the
+            // frame is unchanged and no keyframe is due). Otherwise returns the
+            // new frame hash plus the wire payload.
+            let frame = tokio::task::spawn_blocking(move || -> Result<Option<(u64, Vec<u8>)>> {
                 let monitors = xcap::Monitor::all().map_err(|e| anyhow!("monitors: {e}"))?;
                 let Some(mon) = monitors.get(monitor_index) else {
                     return Ok(None);
@@ -341,6 +358,15 @@ async fn handle_ws_client(
                     (cap_w, cap_h, rgb)
                 };
 
+                // Cheap whole-frame hash. If unchanged and no keyframe is due,
+                // skip the (expensive) JPEG encode entirely.
+                let mut hasher = DefaultHasher::new();
+                hasher.write(&rgb);
+                let hash = hasher.finish();
+                if !force_keyframe && hash == prev_hash {
+                    return Ok(None);
+                }
+
                 let mut jpeg = Vec::with_capacity(64 * 1024);
                 {
                     let mut cursor = Cursor::new(&mut jpeg);
@@ -354,13 +380,16 @@ async fn handle_ws_client(
                 payload.extend_from_slice(&w.to_le_bytes());
                 payload.extend_from_slice(&h.to_le_bytes());
                 payload.extend_from_slice(&jpeg);
-                Ok(Some(payload))
+                Ok(Some((hash, payload)))
             })
             .await
             .map_err(|e| anyhow!("blocking task: {e}"))??;
 
-            if let Some(payload) = payload {
+            if let Some((hash, payload)) = frame {
                 write.send(Message::Binary(payload)).await?;
+                last_hash = hash;
+                have_sent = true;
+                last_send_at = tokio::time::Instant::now();
             }
 
             // Pace ourselves: target frame interval AFTER send completes,
