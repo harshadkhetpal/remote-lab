@@ -22,13 +22,19 @@
     #stage {
       position: fixed; inset: 0;
       display: flex; align-items: center; justify-content: center;
-      touch-action: none;
+      touch-action: none; overflow: hidden;
     }
     #screen {
       max-width: 100%; max-height: 100%;
       image-rendering: auto;
       user-select: none; -webkit-user-select: none;
       -webkit-touch-callout: none;
+      transform-origin: center center; will-change: transform;
+    }
+    #zoomBtn {
+      position: fixed; bottom: 28px; left: 12px;
+      padding: 4px 10px; cursor: pointer;
+      background: rgba(0,0,0,0.55); color: #eee; border: 0; border-radius: 4px; font-size: 12px;
     }
     #help { position: fixed; bottom: 8px; left: 8px; right: 8px;
       font-size: 11px; opacity: 0.6; text-align: center; }
@@ -70,8 +76,9 @@
     <img id="screen" alt="remote screen" draggable="false" />
   </div>
 
-  <div id="help">Tap = click • Long-press = right-click • Two-finger drag = scroll</div>
+  <div id="help">Tap = click • Long-press = right-click • Pinch = zoom • Drag to pan when zoomed</div>
 
+  <button id="zoomBtn" type="button">Zoom 1×</button>
   <button id="clipToggle" type="button">Clipboard</button>
   <div id="clip" class="hidden">
     <textarea id="clipText" placeholder="Type or paste here, then Send to push to host clipboard."></textarea>
@@ -177,7 +184,8 @@
     send({ type: 'mouse_move', x: n.x, y: n.y });
   });
   stage.addEventListener('mousedown', (e) => {
-    const n = normalize(e.clientX, e.clientY); if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
+    const n = normalize(e.clientX, e.clientY); if (!n) return;
+    send({ type: 'mouse_move', x: n.x, y: n.y });
     send({ type: 'mouse_down', button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left' });
     e.preventDefault();
   });
@@ -190,18 +198,46 @@
     e.preventDefault();
   }, { passive: false });
 
+  // ---- Local zoom / pan (viewer-side only; never sent to host) ----
+  // Pinch to zoom the remote image, drag to pan when zoomed. Tap/scroll input
+  // still maps correctly because normalize() reads the transformed rect.
+  let zoom = 1, panX = 0, panY = 0;
+  const zoomBtn = document.getElementById('zoomBtn');
+  function clampPan() {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const iw = img.clientWidth * zoom, ih = img.clientHeight * zoom;
+    const maxX = Math.max(0, (iw - vw) / 2 + 40);
+    const maxY = Math.max(0, (ih - vh) / 2 + 40);
+    panX = Math.max(-maxX, Math.min(maxX, panX));
+    panY = Math.max(-maxY, Math.min(maxY, panY));
+  }
+  function applyTransform() {
+    if (zoom <= 1.001) { zoom = 1; panX = 0; panY = 0; }
+    clampPan();
+    img.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    zoomBtn.textContent = `Zoom ${zoom.toFixed(1)}×`;
+  }
+  zoomBtn.addEventListener('click', () => {
+    zoom = zoom > 1 ? 1 : 2; panX = 0; panY = 0; applyTransform();
+  });
+
   // ---- Touch (mobile) ----
   let touchStart = null, longPressTimer = null, longPressed = false;
-  let twoFingerLastY = null, twoFingerLastX = null;
+  let oneFingerLast = null;
+  let twoFingerLastDist = null, twoFingerLastX = null, twoFingerLastY = null;
 
   stage.addEventListener('touchstart', (e) => {
     if (e.touches.length === 1) {
       const t = e.touches[0];
       touchStart = { x: t.clientX, y: t.clientY, t: performance.now() };
-      const n = normalize(t.clientX, t.clientY);
-      if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
+      oneFingerLast = { x: t.clientX, y: t.clientY };
+      if (zoom === 1) {
+        const n = normalize(t.clientX, t.clientY);
+        if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
+      }
       longPressed = false;
       longPressTimer = setTimeout(() => {
+        if (zoom !== 1) return;
         longPressed = true;
         send({ type: 'mouse_down', button: 'right' });
         send({ type: 'mouse_up',   button: 'right' });
@@ -209,8 +245,9 @@
     } else if (e.touches.length === 2) {
       clearTimeout(longPressTimer);
       const [a, b] = e.touches;
-      twoFingerLastY = (a.clientY + b.clientY) / 2;
+      twoFingerLastDist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
       twoFingerLastX = (a.clientX + b.clientX) / 2;
+      twoFingerLastY = (a.clientY + b.clientY) / 2;
     }
     e.preventDefault();
   }, { passive: false });
@@ -221,32 +258,54 @@
       if (Math.hypot(t.clientX - touchStart.x, t.clientY - touchStart.y) > 8) {
         clearTimeout(longPressTimer);
       }
-      const n = normalize(t.clientX, t.clientY);
-      if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
-    } else if (e.touches.length === 2 && twoFingerLastY !== null) {
+      if (zoom > 1) {
+        // Pan the zoomed view instead of moving the remote cursor.
+        if (oneFingerLast) {
+          panX += t.clientX - oneFingerLast.x;
+          panY += t.clientY - oneFingerLast.y;
+          applyTransform();
+        }
+        oneFingerLast = { x: t.clientX, y: t.clientY };
+      } else {
+        const n = normalize(t.clientX, t.clientY);
+        if (n) send({ type: 'mouse_move', x: n.x, y: n.y });
+      }
+    } else if (e.touches.length === 2 && twoFingerLastDist !== null) {
       const [a, b] = e.touches;
-      const cy = (a.clientY + b.clientY) / 2;
+      const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
       const cx = (a.clientX + b.clientX) / 2;
-      const dy = cy - twoFingerLastY;
-      const dx = cx - twoFingerLastX;
-      twoFingerLastY = cy;
-      twoFingerLastX = cx;
-      send({ type: 'scroll', dx: dx, dy: dy });
+      const cy = (a.clientY + b.clientY) / 2;
+      const ratio = twoFingerLastDist > 0 ? dist / twoFingerLastDist : 1;
+      zoom = Math.max(1, Math.min(5, zoom * ratio));
+      if (zoom > 1) {
+        // Zoomed: pinch zooms, two-finger drag pans. Nothing sent to host.
+        panX += cx - twoFingerLastX;
+        panY += cy - twoFingerLastY;
+        applyTransform();
+      } else {
+        // Not zoomed: two-finger drag scrolls the remote screen (as before).
+        send({ type: 'scroll', dx: cx - twoFingerLastX, dy: cy - twoFingerLastY });
+        applyTransform();
+      }
+      twoFingerLastDist = dist; twoFingerLastX = cx; twoFingerLastY = cy;
     }
     e.preventDefault();
   }, { passive: false });
 
   stage.addEventListener('touchend', (e) => {
     clearTimeout(longPressTimer);
-    if (touchStart && !longPressed && e.touches.length === 0) {
+    if (touchStart && !longPressed && zoom === 1 && e.touches.length === 0) {
+      const ct = e.changedTouches[0];
+      const moved = ct ? Math.hypot(ct.clientX - touchStart.x, ct.clientY - touchStart.y) : 0;
       const dt = performance.now() - touchStart.t;
-      if (dt < 350) {
+      if (dt < 350 && moved < 10) {
+        if (ct) { const n = normalize(ct.clientX, ct.clientY); if (n) send({ type: 'mouse_move', x: n.x, y: n.y }); }
         send({ type: 'mouse_down', button: 'left' });
         send({ type: 'mouse_up',   button: 'left' });
       }
     }
-    if (e.touches.length < 2) { twoFingerLastY = null; twoFingerLastX = null; }
-    if (e.touches.length === 0) touchStart = null;
+    if (e.touches.length < 2) { twoFingerLastDist = null; }
+    if (e.touches.length === 0) { touchStart = null; oneFingerLast = null; }
     e.preventDefault();
   }, { passive: false });
 
@@ -263,12 +322,17 @@
     if (e.key.length === 1) return e.key.toLowerCase();
     return null;
   }
+  function typingInClipboard() {
+    return clipText === document.activeElement || (clip && !clip.classList.contains('hidden'));
+  }
   window.addEventListener('keydown', (e) => {
+    if (typingInClipboard()) return;
     const k = keyName(e); if (!k) return;
     send({ type: 'key_down', key: k });
     if (e.key !== 'F5' && e.key !== 'F12') e.preventDefault();
   });
   window.addEventListener('keyup', (e) => {
+    if (typingInClipboard()) return;
     const k = keyName(e); if (!k) return;
     send({ type: 'key_up', key: k });
   });
